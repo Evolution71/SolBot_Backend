@@ -1,20 +1,23 @@
-"""Background engine: auto-sniper, take-profit / stop-loss monitor and copy trading."""
+"""Background engine: auto-sniper, exit monitor, limit / DCA orders and copy trading."""
 import asyncio
+import json
 import logging
 import time
 from collections import defaultdict, deque
+from datetime import timedelta
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..config import settings
-from ..database import SessionLocal
-from ..models import CopyTarget, Position, SniperConfig, User
+from ..database import SessionLocal, now
+from ..models import CopyTarget, Order, Position, SniperConfig, User
 from ..plans import plan_of
 from . import market, safety, solana, trading
 
 log = logging.getLogger("nexus.engine")
 
+MAX_ORDER_FAILURES = 3
 _events: dict[int, deque] = defaultdict(lambda: deque(maxlen=100))
 _attempted: dict[tuple[int, str], float] = {}  # (user, mint) -> time; never retry the same token
 
@@ -78,9 +81,10 @@ async def run_sniper(db: Session) -> None:
                 continue
             try:
                 trade = await trading.buy(
-                    db, user, token["mint"], cfg.buy_sol, slippage_bps=cfg.slippage_bps, tp_pct=cfg.tp_pct,
-                    sl_pct=cfg.sl_pct, trailing_pct=cfg.trailing_pct, priority_lamports=cfg.priority_lamports,
-                    source="sniper")
+                    db, user, token["mint"], cfg.buy_sol, wallet=trading.wallet_for(db, user, cfg.wallet_id),
+                    slippage_bps=cfg.slippage_bps, tp_pct=cfg.tp_pct, sl_pct=cfg.sl_pct,
+                    trailing_pct=cfg.trailing_pct, tp_levels=cfg.tp_levels, rug_exit_pct=cfg.rug_exit_pct,
+                    priority_lamports=cfg.priority_lamports, source="sniper")
                 emit(user.id, "buy", f"Sniped ${trade.symbol} for {cfg.buy_sol} SOL (safety {report['score']})")
             except trading.TradeError as exc:
                 db.rollback()
@@ -92,25 +96,32 @@ async def run_sniper(db: Session) -> None:
             _attempted.pop(key, None)
 
 
-# ---------- TP / SL / trailing ----------
+# ---------- exits: rug guard, stop-loss, trailing stop, take-profit ----------
 
-def exit_signal(position: Position, price: float) -> str | None:
+def exit_signal(position: Position, price: float, liquidity_usd: float | None = None) -> tuple[str, float, int | None] | None:
+    """Decide whether to sell. Returns (reason, percent to sell, take-profit level index) or None."""
+    if position.rug_exit_pct and position.entry_liquidity_usd > 0 and liquidity_usd is not None:
+        if liquidity_usd <= position.entry_liquidity_usd * (1 - position.rug_exit_pct / 100):
+            return "rug-guard", 100, None
     if position.entry_price_sol <= 0 or price <= 0:
         return None
     change = (price / position.entry_price_sol - 1) * 100
-    if position.tp_pct and change >= position.tp_pct:
-        return "take-profit"
     if position.sl_pct and change <= -position.sl_pct:
-        return "stop-loss"
+        return "stop-loss", 100, None
     if position.trailing_pct and position.peak_price_sol > 0:
         if (price / position.peak_price_sol - 1) * 100 <= -position.trailing_pct:
-            return "trailing-stop"
+            return "trailing-stop", 100, None
+    for index, level in enumerate(trading.load_levels(position.tp_levels)):
+        if not level.get("hit") and change >= level["pct"]:
+            return f"take-profit-{index + 1}", level["sell"], index
+    if position.tp_pct and change >= position.tp_pct:
+        return "take-profit", 100, None
     return None
 
 
 async def monitor_positions(db: Session) -> None:
     positions = db.scalars(select(Position).where(Position.status == "open")).all()
-    watched = [p for p in positions if p.tp_pct or p.sl_pct or p.trailing_pct]
+    watched = [p for p in positions if p.tp_pct or p.sl_pct or p.trailing_pct or p.tp_levels or p.rug_exit_pct]
     if not watched:
         return
     prices = await market.get_tokens([p.mint for p in watched])
@@ -122,16 +133,75 @@ async def monitor_positions(db: Session) -> None:
         if price > position.peak_price_sol:
             position.peak_price_sol = price
             db.commit()
-        reason = exit_signal(position, price)
-        if not reason:
+        signal = exit_signal(position, price, token.get("liquidity_usd"))
+        if not signal:
             continue
+        reason, pct, level_index = signal
         user = db.get(User, position.user_id)
         try:
-            trade = await trading.sell(db, user, position.id, 100, reason=reason)
-            emit(user.id, "sell", f"{reason.title()} hit on ${trade.symbol}: {trade.pnl_lamports / 1e9:+.4f} SOL")
+            trade = await trading.sell(db, user, position.id, pct, reason=reason)
+            if level_index is not None:
+                levels = trading.load_levels(position.tp_levels)
+                levels[level_index]["hit"] = True
+                position.tp_levels = json.dumps(levels)
+                db.commit()
+            emit(user.id, "sell", f"{reason.replace('-', ' ').title()} on ${trade.symbol}: sold {pct:g}% "
+                                  f"({trade.pnl_lamports / 1e9:+.4f} SOL)")
         except trading.TradeError as exc:
             db.rollback()
             emit(user.id, "error", f"Auto-sell of ${position.symbol} failed - {exc}")
+
+
+# ---------- limit orders and DCA ----------
+
+async def run_orders(db: Session) -> None:
+    orders = db.scalars(select(Order).where(Order.status == "active")).all()
+    if not orders:
+        return
+    prices = await market.get_tokens([o.mint for o in orders])
+    for order in orders:
+        user = db.get(User, order.user_id)
+        if not user or not user.is_active or plan_of(user)["orders"] <= 0:
+            continue  # paused while the plan does not include orders
+        if order.expires_at and order.expires_at <= now():
+            order.status = "expired"
+            db.commit()
+            emit(user.id, "info", f"{order.kind.upper()} order for ${order.symbol} expired")
+            continue
+        token = prices.get(order.mint)
+        if not token or token["price_usd"] <= 0:
+            continue
+        if order.kind == "dca" and order.next_run_at and order.next_run_at > now():
+            continue
+        if order.trigger_price_usd and token["price_usd"] > order.trigger_price_usd:
+            continue
+        try:
+            trade = await trading.buy(
+                db, user, order.mint, order.sol_per_order, wallet=trading.wallet_for(db, user, order.wallet_id),
+                slippage_bps=order.slippage_bps, tp_pct=order.tp_pct, sl_pct=order.sl_pct,
+                trailing_pct=order.trailing_pct, tp_levels=order.tp_levels, rug_exit_pct=order.rug_exit_pct,
+                source=order.kind)
+        except trading.TradeError as exc:
+            db.rollback()
+            order.fail_count += 1
+            order.last_error = str(exc)[:200]
+            if order.fail_count >= MAX_ORDER_FAILURES:
+                order.status = "failed"
+            elif order.kind == "dca":
+                order.next_run_at = now() + timedelta(minutes=order.interval_minutes or 1)
+            db.commit()
+            emit(user.id, "error", f"{order.kind.upper()} order for ${order.symbol} failed - {exc}")
+            continue
+        order.filled_orders += 1
+        order.spent_lamports += trade.sol_lamports + trade.fee_lamports
+        order.fail_count, order.last_error = 0, ""
+        if order.filled_orders >= order.total_orders:
+            order.status = "filled"
+        else:
+            order.next_run_at = now() + timedelta(minutes=order.interval_minutes or 1)
+        db.commit()
+        label = "Limit order filled" if order.kind == "limit" else f"DCA buy {order.filled_orders}/{order.total_orders}"
+        emit(user.id, "buy", f"{label}: ${trade.symbol} for {order.sol_per_order} SOL")
 
 
 # ---------- copy trading ----------
@@ -206,6 +276,7 @@ async def _mirror(db: Session, user: User, target: CopyTarget, swap: dict) -> No
     try:
         if swap["side"] == "buy":
             trade = await trading.buy(db, user, swap["mint"], target.buy_sol,
+                                      wallet=trading.wallet_for(db, user, target.wallet_id),
                                       slippage_bps=target.slippage_bps, source="copy")
             emit(user.id, "buy", f"Copied {name}: bought ${trade.symbol} for {target.buy_sol} SOL")
         elif target.copy_sells:
@@ -223,7 +294,7 @@ async def _mirror(db: Session, user: User, target: CopyTarget, swap: dict) -> No
 # ---------- loop ----------
 
 async def tick() -> None:
-    for step in (run_sniper, monitor_positions, run_copy):
+    for step in (run_sniper, run_orders, monitor_positions, run_copy):
         db = SessionLocal()
         try:
             await step(db)

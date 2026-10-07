@@ -11,7 +11,7 @@ from ..config import settings
 from ..database import get_db, now
 from ..deps import current_user
 from ..models import Payment, User
-from ..plans import PLAN_DAYS, PLANS, effective_plan_id
+from ..plans import PLAN_DAYS, PLANS, TRIAL_DAYS, TRIAL_PLAN, effective_plan_id
 from ..services import market, solana
 
 router = APIRouter(prefix="/api/billing", tags=["billing"])
@@ -43,7 +43,22 @@ def activate(user: User, plan_id: str) -> None:
 @router.get("/plans")
 async def plans():
     return {"plans": list(PLANS.values()), "treasury": settings.treasury_wallet,
-            "sol_usd": await market.sol_price_usd(), "days": PLAN_DAYS}
+            "sol_usd": await market.sol_price_usd(), "days": PLAN_DAYS,
+            "trial": {"plan": TRIAL_PLAN, "plan_name": PLANS[TRIAL_PLAN]["name"], "days": TRIAL_DAYS}}
+
+
+@router.post("/trial")
+def start_trial(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """One free trial per account. No payment is taken and nothing renews automatically."""
+    if user.trial_used:
+        raise HTTPException(400, "You have already used your free trial")
+    if effective_plan_id(user) != "free":
+        raise HTTPException(400, "You already have an active paid plan")
+    user.trial_used = True
+    user.plan = TRIAL_PLAN
+    user.plan_expires_at = now() + timedelta(days=TRIAL_DAYS)
+    db.commit()
+    return {"plan": TRIAL_PLAN, "plan_name": PLANS[TRIAL_PLAN]["name"], "expires_at": user.plan_expires_at}
 
 
 @router.post("/invoice")

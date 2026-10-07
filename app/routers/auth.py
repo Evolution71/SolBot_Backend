@@ -13,7 +13,7 @@ from ..config import settings
 from ..database import get_db, now
 from ..deps import current_user
 from ..models import SniperConfig, User, Wallet
-from ..plans import effective_plan_id, fee_bps_for, plan_of
+from ..plans import LIMIT_KEYS, TRIAL_DAYS, effective_plan_id, fee_bps_for, plan_of
 from ..security import create_token, hash_password, verify_password
 from ..services import solana
 
@@ -47,8 +47,8 @@ def user_out(user: User) -> dict:
     return {
         "id": user.id, "email": user.email, "username": user.username, "is_admin": user.is_admin,
         "plan": effective_plan_id(user), "plan_name": plan["name"], "plan_expires_at": user.plan_expires_at,
-        "limits": {k: plan[k] for k in ("daily_buys", "max_positions", "auto_snipe", "tp_sl", "trailing",
-                                        "copy_wallets", "priority_fees")},
+        "limits": {k: plan[k] for k in LIMIT_KEYS},
+        "trial_available": not user.trial_used and effective_plan_id(user) == "free", "trial_days": TRIAL_DAYS,
         "fee_bps": fee_bps_for(user), "fee_free_until": user.fee_free_until,
         "referral_code": user.referral_code, "wallet": user.wallet.pubkey if user.wallet else None,
         "paper_trading": settings.paper_trading, "created_at": user.created_at,
@@ -79,7 +79,7 @@ def register(body: RegisterIn, request: Request, db: Session = Depends(get_db)):
     if user.id <= settings.launch_promo_users:
         user.fee_free_until = now() + timedelta(days=settings.launch_promo_days)
     pubkey, enc_secret = solana.new_wallet()
-    db.add(Wallet(user_id=user.id, pubkey=pubkey, enc_secret=enc_secret,
+    db.add(Wallet(user_id=user.id, label="Main", is_default=True, pubkey=pubkey, enc_secret=enc_secret,
                   paper_lamports=int(settings.paper_start_sol * solana.LAMPORTS)))
     db.add(SniperConfig(user_id=user.id))
     db.commit()

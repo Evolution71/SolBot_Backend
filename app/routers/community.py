@@ -49,6 +49,17 @@ def leaderboard(db: Session = Depends(get_db)):
                      for i, (name, total, count) in enumerate(rows)]}
 
 
+@router.get("/stats")
+def public_stats(db: Session = Depends(get_db)):
+    """Real platform totals for the landing page. Live trades only - practice trades are never counted."""
+    live = Trade.paper.is_(False)
+    volume = db.scalar(select(func.coalesce(func.sum(Trade.sol_lamports), 0)).where(live)) or 0
+    return {"paper_trading": settings.paper_trading,
+            "users": db.scalar(select(func.count(User.id))) or 0,
+            "trades": db.scalar(select(func.count(Trade.id)).where(live)) or 0,
+            "volume_sol": volume / LAMPORTS}
+
+
 # ---------- admin ----------
 
 class PlanIn(BaseModel):
@@ -92,7 +103,7 @@ def admin_users(q: str = "", _: User = Depends(admin_user), db: Session = Depend
     return {"users": [{
         "id": u.id, "email": u.email, "username": u.username, "plan": effective_plan_id(u),
         "plan_expires_at": u.plan_expires_at, "is_active": u.is_active, "is_admin": u.is_admin,
-        "wallet": u.wallet.pubkey if u.wallet else None, "created_at": u.created_at,
+        "wallet": u.wallet.pubkey if u.wallet else None, "wallets": len(u.wallets), "created_at": u.created_at,
     } for u in db.scalars(query).all()]}
 
 

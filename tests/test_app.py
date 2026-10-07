@@ -17,14 +17,15 @@ def test_register_login_and_wallet(client):
     assert client.post("/api/auth/login", json={"email": "alice@test.io", "password": "nope"}).status_code == 401
     assert client.post("/api/auth/login", json={"email": "alice@test.io", "password": "password123"}).status_code == 200
     wallet = client.get("/api/wallet", headers=headers).json()
-    assert wallet["sol"] == 10 and wallet["address"] == user["wallet"]
+    assert wallet["sol"] == 10 and wallet["address"] == user["wallet"] and len(wallet["wallets"]) == 1
     assert client.post("/api/auth/register", json={"email": "alice@test.io", "username": "x12", "password": "password123"}).status_code == 400
 
 
 def test_key_export_roundtrip_requires_password(client):
     headers, user = signup(client)
-    assert client.post("/api/wallet/export", json={"password": "wrong"}, headers=headers).status_code == 403
-    secret = client.post("/api/wallet/export", json={"password": "password123"}, headers=headers).json()["secret_key"]
+    wid = client.get("/api/wallet", headers=headers).json()["wallets"][0]["id"]
+    assert client.post(f"/api/wallet/{wid}/export", json={"password": "wrong"}, headers=headers).status_code == 403
+    secret = client.post(f"/api/wallet/{wid}/export", json={"password": "password123"}, headers=headers).json()["secret_key"]
     from solders.keypair import Keypair
     assert str(Keypair.from_base58_string(secret).pubkey()) == user["wallet"]
     with SessionLocal() as db:
@@ -218,3 +219,181 @@ def test_partial_signing_matches_full_signing():
     assert base64.b64decode(jupiter.sign_order(kp, unsigned)) == bytes(VersionedTransaction(msg, [kp]))
     with pytest.raises(jupiter.SwapError):
         jupiter.sign_order(Keypair(), unsigned)
+
+
+# ---------------------------------------------------------------- version 1.1 features
+
+def _paid(client, name="trader", plan="elite"):
+    """A user on a paid plan (set by the admin account)."""
+    admin, _ = signup(client, "boss", email="admin@test.io")
+    headers, user = signup(client, name)
+    assert client.post(f"/api/admin/users/{user['id']}/plan", json={"plan": plan}, headers=admin).status_code == 200
+    return headers, user
+
+
+def test_free_trial_once_and_unlocks_features(client):
+    headers, user = signup(client)
+    assert user["trial_available"] and client.post("/api/orders", json={
+        "kind": "limit", "mint": MINT, "sol_per_order": 0.1, "trigger_price_usd": 0.0001}, headers=headers).status_code == 403
+    trial = client.post("/api/billing/trial", headers=headers)
+    assert trial.status_code == 200 and trial.json()["plan"] == "pro"
+    me = client.get("/api/auth/me", headers=headers).json()
+    assert me["plan"] == "pro" and me["limits"]["orders"] == 10 and not me["trial_available"]
+    assert client.post("/api/billing/trial", headers=headers).status_code == 400
+    with SessionLocal() as db:                                        # trial lapses back to free on its own
+        u = db.scalar(select(User)); u.plan_expires_at = u.plan_expires_at.replace(year=2000); db.commit()
+    me = client.get("/api/auth/me", headers=headers).json()
+    assert me["plan"] == "free" and not me["trial_available"]
+
+
+def test_multi_wallet_isolated_balances_and_limits(client):
+    headers, _ = _paid(client, plan="pro")
+    assert client.post("/api/wallet", json={"label": "Degen"}, headers=headers).status_code == 200
+    assert client.post("/api/wallet", json={"label": "Safe"}, headers=headers).status_code == 200
+    assert client.post("/api/wallet", json={"label": "Fourth"}, headers=headers).status_code == 403   # Hunter = 3
+    data = client.get("/api/wallet", headers=headers).json()
+    main, degen, _safe = data["wallets"]
+    assert data["sol"] == 30 and main["is_default"] and not degen["is_default"] and len({w["address"] for w in data["wallets"]}) == 3
+
+    client.post("/api/trade/buy", json={"mint": MINT, "sol": 2, "wallet_id": degen["id"]}, headers=headers)
+    client.post("/api/trade/buy", json={"mint": MINT, "sol": 1}, headers=headers)                     # default wallet
+    by_label = {w["label"]: w["sol"] for w in client.get("/api/wallet", headers=headers).json()["wallets"]}
+    assert by_label["Degen"] == pytest.approx(10 - 2 * 1.0075) and by_label["Main"] == pytest.approx(10 - 1.0075)
+    positions = client.get("/api/trade/positions", headers=headers).json()["positions"]
+    assert sorted(p["wallet"] for p in positions) == ["Degen", "Main"]                                 # one position per wallet
+    degen_pos = next(p for p in positions if p["wallet"] == "Degen")
+    client.post("/api/trade/sell", json={"position_id": degen_pos["id"]}, headers=headers)
+    by_label = {w["label"]: w["sol"] for w in client.get("/api/wallet", headers=headers).json()["wallets"]}
+    assert by_label["Degen"] > 10 - 2 * 1.0075 and by_label["Main"] == pytest.approx(10 - 1.0075)      # proceeds return to Degen
+
+    other, _ = signup(client, "mallory")                                                               # cannot touch someone else's wallet
+    assert client.post(f"/api/wallet/{degen['id']}/export", json={"password": "password123"}, headers=other).status_code == 404
+    assert client.patch(f"/api/wallet/{degen['id']}", json={"is_default": True}, headers=headers).status_code == 200
+    assert client.get("/api/auth/me", headers=headers).json()["wallet"] == degen["address"]
+
+
+def test_multi_level_take_profit_and_stop(client, state):
+    headers, _ = _paid(client)
+    body = {"mint": MINT, "sol": 1, "sl_pct": 30,
+            "tp_levels": [{"pct": 100, "sell": 50}, {"pct": 50, "sell": 50}]}                          # stored lowest first
+    assert client.post("/api/trade/buy", json=body, headers=headers).status_code == 200
+    pos = client.get("/api/trade/positions", headers=headers).json()["positions"][0]
+    assert [l["pct"] for l in pos["tp_levels"]] == [50, 100] and pos["tokens"] == pytest.approx(990_000)
+
+    state["price"] = 0.0000016                                                                         # +58%: level 1 only
+    asyncio.run(engine.tick()); asyncio.run(engine.tick())                                             # a hit level never fires twice
+    pos = client.get("/api/trade/positions", headers=headers).json()["positions"][0]
+    assert pos["tokens"] == pytest.approx(495_000) and [l["hit"] for l in pos["tp_levels"]] == [True, False]
+    state["price"] = 0.0000022                                                                         # +118%: level 2
+    asyncio.run(engine.tick())
+    pos = client.get("/api/trade/positions", headers=headers).json()["positions"][0]
+    assert pos["tokens"] == pytest.approx(247_500)
+    state["price"] = 0.0000006                                                                         # -40%: stop-loss closes the rest
+    asyncio.run(engine.tick())
+    assert client.get("/api/trade/positions", headers=headers).json()["positions"] == []
+    reasons = [t["reason"] for t in client.get("/api/trade/history", headers=headers).json()["trades"] if t["side"] == "sell"]
+    assert reasons == ["stop-loss", "take-profit-2", "take-profit-1"]
+    bad = client.post("/api/trade/buy", json={"mint": MINT, "sol": 1, "tp_levels": [{"pct": 50, "sell": 150}]}, headers=headers)
+    assert bad.status_code == 422
+
+
+def test_rug_guard_sells_when_liquidity_is_pulled(client, state, monkeypatch):
+    from app.services import market
+    from tests.conftest import TOKEN
+    headers, _ = _paid(client)
+    client.post("/api/trade/buy", json={"mint": MINT, "sol": 1, "rug_exit_pct": 40}, headers=headers)  # entry liquidity $50k
+    liquidity = {"usd": 35_000}
+
+    async def get_tokens(mints, ttl=4):
+        return {m: {**TOKEN, "mint": m, "price_sol": state["price"], "liquidity_usd": liquidity["usd"]} for m in mints}
+
+    monkeypatch.setattr(market, "get_tokens", get_tokens)
+    asyncio.run(engine.tick())                                                                         # -30%: holds
+    assert len(client.get("/api/trade/positions", headers=headers).json()["positions"]) == 1
+    liquidity["usd"] = 29_000                                                                          # -42%: exit
+    asyncio.run(engine.tick())
+    assert client.get("/api/trade/positions", headers=headers).json()["positions"] == []
+    assert client.get("/api/trade/history", headers=headers).json()["trades"][0]["reason"] == "rug-guard"
+
+
+def test_limit_order_ladder_fills_only_at_target(client, state):
+    headers, _ = _paid(client)
+    usd = lambda: state["price"] * 200                                                                 # test token: 1 SOL = $200
+    made = client.post("/api/orders", json={
+        "kind": "limit", "mint": MINT, "sol_per_order": 0.5, "trigger_price_usd": 0.00016,
+        "ladder_levels": 2, "ladder_step_pct": 25, "tp_pct": 50}, headers=headers)
+    assert made.status_code == 200 and [round(o["trigger_price_usd"], 6) for o in made.json()["orders"]] == [0.00016, 0.00012]
+
+    async def get_tokens(mints, ttl=4):
+        from tests.conftest import TOKEN
+        return {m: {**TOKEN, "mint": m, "price_sol": state["price"], "price_usd": usd()} for m in mints}
+    from app.services import market
+    market.get_tokens = get_tokens                                                                     # (monkeypatched module, restored by fixture)
+
+    asyncio.run(engine.tick())                                                                         # $0.0002: above both
+    assert client.get("/api/trade/positions", headers=headers).json()["positions"] == []
+    state["price"] = 0.00000075                                                                        # $0.00015: first level only
+    asyncio.run(engine.tick()); asyncio.run(engine.tick())
+    orders = client.get("/api/orders", headers=headers).json()["orders"]
+    assert sorted(o["status"] for o in orders) == ["active", "filled"]
+    pos = client.get("/api/trade/positions", headers=headers).json()["positions"]
+    assert len(pos) == 1 and pos[0]["source"] == "limit" and pos[0]["tp_pct"] == 50 and pos[0]["cost_sol"] == pytest.approx(0.5 * 1.005)
+    remaining = next(o for o in orders if o["status"] == "active")
+    assert client.delete(f"/api/orders/{remaining['id']}", headers=headers).status_code == 200
+    state["price"] = 0.0000001
+    asyncio.run(engine.tick())                                                                         # cancelled order never fills
+    assert client.get("/api/trade/positions", headers=headers).json()["positions"][0]["cost_sol"] == pytest.approx(0.5 * 1.005)
+
+
+def test_dca_buys_on_schedule_then_completes(client):
+    from app.models import Order
+    headers, _ = _paid(client)
+    made = client.post("/api/orders", json={"kind": "dca", "mint": MINT, "sol_per_order": 0.2,
+                                            "total_orders": 3, "interval_minutes": 60}, headers=headers)
+    assert made.status_code == 200
+    asyncio.run(engine.tick()); asyncio.run(engine.tick())                                             # first buy now, second must wait
+    order = client.get("/api/orders", headers=headers).json()["orders"][0]
+    assert order["filled_orders"] == 1 and order["status"] == "active"
+    for expected in (2, 3):
+        with SessionLocal() as db:
+            o = db.scalar(select(Order)); o.next_run_at = o.next_run_at.replace(year=2000); db.commit()
+        asyncio.run(engine.tick())
+        assert client.get("/api/orders", headers=headers).json()["orders"][0]["filled_orders"] == expected
+    order = client.get("/api/orders", headers=headers).json()["orders"][0]
+    assert order["status"] == "filled" and order["spent_sol"] == pytest.approx(3 * 0.2 * 1.005)
+    pos = client.get("/api/trade/positions", headers=headers).json()["positions"]
+    assert len(pos) == 1 and pos[0]["cost_sol"] == pytest.approx(3 * 0.2 * 1.005)                      # averaged into one position
+
+
+def test_failed_order_stops_after_three_attempts(client):
+    headers, _ = _paid(client)
+    client.post("/api/orders", json={"kind": "limit", "mint": MINT, "sol_per_order": 500, "trigger_price_usd": 1}, headers=headers)
+    for _ in range(4):
+        asyncio.run(engine.tick())
+    order = client.get("/api/orders", headers=headers).json()["orders"][0]
+    assert order["status"] == "failed" and "Insufficient" in order["last_error"]
+
+
+def test_upgrade_keeps_data_from_version_1_database(tmp_path):
+    """A v1 database (one wallet per user, no new columns) is brought forward without losing anything."""
+    from sqlalchemy import create_engine, inspect, text
+    from app.migrate import upgrade
+    eng = create_engine(f"sqlite:///{tmp_path / 'v1.db'}")
+    with eng.begin() as c:
+        c.execute(text("CREATE TABLE users (id INTEGER PRIMARY KEY, email VARCHAR(255), username VARCHAR(32), password_hash VARCHAR(255),"
+                       " is_admin BOOLEAN, is_active BOOLEAN, plan VARCHAR(16), plan_expires_at DATETIME, fee_free_until DATETIME,"
+                       " referral_code VARCHAR(16), referred_by_id INTEGER, referral_reward_granted BOOLEAN, created_at DATETIME)"))
+        c.execute(text("CREATE TABLE wallets (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, pubkey VARCHAR(64), enc_secret TEXT,"
+                       " paper_lamports BIGINT, UNIQUE (user_id), UNIQUE (pubkey))"))
+        c.execute(text("CREATE TABLE positions (id INTEGER PRIMARY KEY, user_id INTEGER, mint VARCHAR(64), status VARCHAR(8))"))
+        c.execute(text("INSERT INTO users (id, email, username, plan, is_active) VALUES (1, 'a@b.c', 'old', 'free', 1)"))
+        c.execute(text("INSERT INTO wallets (id, user_id, pubkey, enc_secret, paper_lamports) VALUES (7, 1, 'PUB', 'SECRET', 5)"))
+        c.execute(text("INSERT INTO positions (id, user_id, mint, status) VALUES (1, 1, 'M', 'open')"))
+    upgrade(eng); upgrade(eng)                                                                          # safe to run on every start
+    with eng.begin() as c:
+        assert c.execute(text("SELECT id, user_id, pubkey, enc_secret, paper_lamports, label, is_default FROM wallets")).all() == \
+            [(7, 1, "PUB", "SECRET", 5, "Main", 1)]
+        c.execute(text("INSERT INTO wallets (user_id, pubkey, enc_secret, paper_lamports, label, is_default) VALUES (1, 'PUB2', 'S2', 0, 'Second', 0)"))
+        assert c.execute(text("SELECT trial_used FROM users")).scalar() == 0
+        assert c.execute(text("SELECT wallet_id, tp_levels, entry_liquidity_usd FROM positions")).all() == [(None, None, 0.0)]
+    assert "orders" in inspect(eng).get_table_names()

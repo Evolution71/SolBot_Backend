@@ -2,41 +2,47 @@
 from .database import now
 
 PLAN_DAYS = 30
+TRIAL_DAYS = 3
+TRIAL_PLAN = "pro"
 
 PLANS: dict[str, dict] = {
     "free": {
         "id": "free", "name": "Scout", "price_usd": 0, "rank": 0,
-        "fee_bps": 100, "daily_buys": 5, "max_positions": 3,
+        "fee_bps": 100, "daily_buys": 5, "max_positions": 3, "wallets": 1, "orders": 0,
         "auto_snipe": False, "tp_sl": False, "trailing": False, "copy_wallets": 0, "priority_fees": False,
         "tagline": "Learn the terminal with manual trades.",
         "features": ["Live token discovery feed", "Rug-risk safety score", "Manual buy & sell",
-                     "5 buys per day, 3 open positions", "1% fee per trade"],
+                     "5 buys per day, 3 open positions", "1 trading wallet", "1% fee per trade"],
     },
     "pro": {
         "id": "pro", "name": "Hunter", "price_usd": 100, "rank": 1,
-        "fee_bps": 75, "daily_buys": None, "max_positions": 15,
+        "fee_bps": 75, "daily_buys": None, "max_positions": 15, "wallets": 3, "orders": 10,
         "auto_snipe": True, "tp_sl": True, "trailing": False, "copy_wallets": 2, "priority_fees": False,
         "tagline": "Automation for active traders.",
-        "features": ["Everything in Scout", "Auto-sniper with safety filters", "Take-profit & stop-loss",
-                     "Copy 2 wallets", "Unlimited buys, 15 open positions", "0.75% fee per trade"],
+        "features": ["Everything in Scout", "Auto-sniper with safety filters", "Limit orders & DCA (10 active)",
+                     "Multi-level take-profit, stop-loss", "Liquidity-pull guard", "Up to 3 wallets",
+                     "Copy 2 wallets", "0.75% fee per trade"],
     },
     "elite": {
         "id": "elite", "name": "Apex", "price_usd": 500, "rank": 2,
-        "fee_bps": 50, "daily_buys": None, "max_positions": 50,
+        "fee_bps": 50, "daily_buys": None, "max_positions": 50, "wallets": 10, "orders": 50,
         "auto_snipe": True, "tp_sl": True, "trailing": True, "copy_wallets": 10, "priority_fees": True,
         "tagline": "Speed and control for serious size.",
         "features": ["Everything in Hunter", "Trailing stop-loss", "Custom priority fees",
-                     "Copy 10 wallets", "50 open positions", "0.5% fee per trade"],
+                     "Up to 10 wallets", "50 active orders", "Copy 10 wallets", "0.5% fee per trade"],
     },
     "whale": {
         "id": "whale", "name": "Leviathan", "price_usd": 1000, "rank": 3,
-        "fee_bps": 25, "daily_buys": None, "max_positions": 200,
+        "fee_bps": 25, "daily_buys": None, "max_positions": 200, "wallets": 50, "orders": 200,
         "auto_snipe": True, "tp_sl": True, "trailing": True, "copy_wallets": 30, "priority_fees": True,
         "tagline": "Lowest fees, highest limits.",
-        "features": ["Everything in Apex", "Copy 30 wallets", "200 open positions",
+        "features": ["Everything in Apex", "Up to 50 wallets", "200 active orders", "Copy 30 wallets",
                      "0.25% fee per trade", "Priority support"],
     },
 }
+
+LIMIT_KEYS = ("daily_buys", "max_positions", "wallets", "orders", "auto_snipe", "tp_sl", "trailing",
+              "copy_wallets", "priority_fees")
 
 
 def effective_plan_id(user) -> str:

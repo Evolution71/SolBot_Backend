@@ -78,6 +78,14 @@ async def get_balance(pubkey: str) -> int:
     return int(res["value"])
 
 
+async def get_balances(pubkeys: list[str]) -> list[int]:
+    """SOL balances (lamports) of up to 100 accounts in one request. Unfunded accounts report 0."""
+    if not pubkeys:
+        return []
+    res = await rpc("getMultipleAccounts", [pubkeys[:100], {"commitment": "confirmed", "dataSlice": {"offset": 0, "length": 0}}])
+    return [int(acc["lamports"]) if acc else 0 for acc in res["value"]]
+
+
 async def get_mint_info(mint: str) -> dict:
     """Decimals, supply and authorities of a token mint (cached for 60s)."""
     hit = _mint_cache.get(mint)

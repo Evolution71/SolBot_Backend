@@ -16,13 +16,27 @@ from ..services.solana import LAMPORTS
 router = APIRouter(prefix="/api/trade", tags=["trade"])
 
 
-class BuyIn(BaseModel):
-    mint: str
-    sol: float = Field(gt=0, le=1000)
-    slippage_bps: int = Field(default=1500, ge=10, le=5000)
+class Level(BaseModel):
+    pct: float = Field(gt=0, le=100000)   # gain that triggers this level
+    sell: float = Field(gt=0, le=100)     # percent of the remaining position to sell
+
+
+class ExitRules(BaseModel):
     tp_pct: float | None = Field(default=None, gt=0, le=100000)
     sl_pct: float | None = Field(default=None, gt=0, lt=100)
     trailing_pct: float | None = Field(default=None, gt=0, lt=100)
+    tp_levels: list[Level] | None = Field(default=None, max_length=trading.MAX_TP_LEVELS)
+    rug_exit_pct: float | None = Field(default=None, ge=5, le=95)
+
+    def levels(self) -> list[dict] | None:
+        return [l.model_dump() for l in self.tp_levels] if self.tp_levels else None
+
+
+class BuyIn(ExitRules):
+    mint: str
+    sol: float = Field(gt=0, le=1000)
+    wallet_id: int | None = None
+    slippage_bps: int = Field(default=1500, ge=10, le=5000)
     priority_lamports: int = Field(default=0, ge=0, le=100_000_000)
 
 
@@ -31,12 +45,6 @@ class SellIn(BaseModel):
     pct: float = Field(default=100, gt=0, le=100)
     slippage_bps: int = Field(default=1500, ge=10, le=5000)
     priority_lamports: int = Field(default=0, ge=0, le=100_000_000)
-
-
-class TargetsIn(BaseModel):
-    tp_pct: float | None = Field(default=None, gt=0, le=100000)
-    sl_pct: float | None = Field(default=None, gt=0, lt=100)
-    trailing_pct: float | None = Field(default=None, gt=0, lt=100)
 
 
 def trade_out(t: Trade) -> dict:
@@ -49,7 +57,7 @@ def trade_out(t: Trade) -> dict:
     }
 
 
-def position_out(p: Position, token: dict | None) -> dict:
+def position_out(p: Position, token: dict | None, labels: dict[int, str] | None = None) -> dict:
     tokens = int(p.token_amount) / 10 ** p.decimals
     cost = p.cost_lamports / LAMPORTS
     price = token["price_sol"] if token else None
@@ -57,22 +65,25 @@ def position_out(p: Position, token: dict | None) -> dict:
     return {
         "id": p.id, "mint": p.mint, "symbol": p.symbol, "name": p.name, "image": p.image, "status": p.status,
         "source": p.source, "paper": p.paper, "tokens": tokens, "cost_sol": cost,
+        "wallet_id": p.wallet_id, "wallet": (labels or {}).get(p.wallet_id, "Main"),
         "entry_price_sol": p.entry_price_sol, "price_sol": price, "value_sol": value,
         "pnl_sol": None if value is None else value - cost,
         "pnl_pct": None if value is None or cost <= 0 else (value / cost - 1) * 100,
         "realized_pnl_sol": p.realized_pnl_lamports / LAMPORTS,
         "tp_pct": p.tp_pct, "sl_pct": p.sl_pct, "trailing_pct": p.trailing_pct,
+        "tp_levels": trading.load_levels(p.tp_levels), "rug_exit_pct": p.rug_exit_pct,
+        "entry_liquidity_usd": p.entry_liquidity_usd, "liquidity_usd": token["liquidity_usd"] if token else None,
         "opened_at": p.opened_at, "closed_at": p.closed_at,
     }
 
 
 @router.post("/buy")
 async def buy(body: BuyIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    user = db.merge(user)
     try:
-        trade = await trading.buy(db, user, body.mint, body.sol, slippage_bps=body.slippage_bps, tp_pct=body.tp_pct,
-                                  sl_pct=body.sl_pct, trailing_pct=body.trailing_pct,
-                                  priority_lamports=body.priority_lamports)
+        trade = await trading.buy(
+            db, user, body.mint, body.sol, wallet=trading.wallet_for(db, user, body.wallet_id),
+            slippage_bps=body.slippage_bps, tp_pct=body.tp_pct, sl_pct=body.sl_pct, trailing_pct=body.trailing_pct,
+            tp_levels=body.levels(), rug_exit_pct=body.rug_exit_pct, priority_lamports=body.priority_lamports)
     except trading.TradeError as exc:
         db.rollback()
         raise HTTPException(400, str(exc)) from exc
@@ -81,7 +92,6 @@ async def buy(body: BuyIn, user: User = Depends(current_user), db: Session = Dep
 
 @router.post("/sell")
 async def sell(body: SellIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    user = db.merge(user)
     try:
         trade = await trading.sell(db, user, body.position_id, body.pct, slippage_bps=body.slippage_bps,
                                    priority_lamports=body.priority_lamports)
@@ -96,22 +106,28 @@ async def positions(status: str = "open", user: User = Depends(current_user), db
     query = select(Position).where(Position.user_id == user.id, Position.status == status)
     rows = db.scalars(query.order_by(Position.opened_at.desc()).limit(200)).all()
     prices = await market.get_tokens([p.mint for p in rows]) if status == "open" else {}
-    return {"positions": [position_out(p, prices.get(p.mint)) for p in rows]}
+    labels = {w.id: w.label for w in user.wallets}
+    return {"positions": [position_out(p, prices.get(p.mint), labels) for p in rows]}
 
 
 @router.patch("/positions/{position_id}")
-def set_targets(position_id: int, body: TargetsIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
+def set_targets(position_id: int, body: ExitRules, user: User = Depends(current_user), db: Session = Depends(get_db)):
     position = db.get(Position, position_id)
     if not position or position.user_id != user.id or position.status != "open":
         raise HTTPException(404, "Position not found")
     plan = plan_of(user)
     if not plan["tp_sl"]:
-        raise HTTPException(403, "Take-profit and stop-loss need the Hunter plan or higher")
+        raise HTTPException(403, "Exit rules need the Hunter plan or higher")
     if body.trailing_pct and not plan["trailing"]:
         raise HTTPException(403, "Trailing stops need the Apex plan or higher")
+    try:
+        position.tp_levels = trading.clean_levels(body.levels())
+    except (trading.TradeError, KeyError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
     position.tp_pct, position.sl_pct, position.trailing_pct = body.tp_pct, body.sl_pct, body.trailing_pct
+    position.rug_exit_pct = body.rug_exit_pct
     db.commit()
-    return position_out(position, None)
+    return position_out(position, None, {w.id: w.label for w in user.wallets})
 
 
 @router.get("/history")

@@ -6,8 +6,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
-from .database import Base, engine
-from .routers import auth, automation, billing, community, market, trade, wallet
+from .database import engine
+from .migrate import upgrade
+from .routers import auth, automation, billing, community, market, orders, trade, wallet
 from .services import engine as bot_engine
 from .services import solana
 
@@ -19,21 +20,21 @@ async def lifespan(_: FastAPI):
     settings.assert_production_ready()
     if not solana.is_valid_address(settings.treasury_wallet):
         raise RuntimeError("TREASURY_WALLET is not a valid Solana address")
-    Base.metadata.create_all(engine)
+    upgrade(engine)
     task = asyncio.create_task(bot_engine.run_forever()) if settings.engine_enabled else None
     yield
     if task:
         task.cancel()
 
 
-app = FastAPI(title=settings.app_name, version="1.0.0", lifespan=lifespan)
+app = FastAPI(title=settings.app_name, version="1.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in settings.cors_origins.split(",") if o.strip()],
     allow_methods=["*"], allow_headers=["*"],
 )
 
-for module in (auth, wallet, market, trade, automation, billing, community):
+for module in (auth, wallet, market, trade, orders, automation, billing, community):
     app.include_router(module.router)
 
 
